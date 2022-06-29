@@ -63,6 +63,22 @@ uint16_t VREFINT_CAL;
 uint16_t VREFINT_DATA;
 uint8_t BAT_Q;
 uint8_t NB_Signal_Value;
+
+uint8_t NB_OBSERVERSP_CMD[50] = "AT+MIPLOBSERVERSP=0,";
+uint8_t NB_DISCOVERRSP_CMD[50] = "AT+MIPLDISCOVERRSP=0,";
+uint8_t NB_NOTIFY5700_CMD[60] = "AT+MIPLNOTIFY=0,";	// battery
+uint8_t NB_NOTIFY5513_CMD[60] = "AT+MIPLNOTIFY=0,";	// latitude
+uint8_t NB_NOTIFY5514_CMD[60] = "AT+MIPLNOTIFY=0,";	// longitude
+uint8_t NB_OB3320_count;	// the number of bits of subscription request
+uint8_t NB_OB3336_count;
+uint8_t onenet_ok = 0;
+uint32_t temp_int;
+float temp_float;
+uint32_t lat_int;	// get latitude dd
+float lat_float;	// get latitude mm
+uint32_t lng_int;	// get longitude dd
+float lng_float;	// get longitude mm
+uint8_t shutdown = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -74,6 +90,7 @@ static void MX_USART2_UART_Init(void);
 /* USER CODE BEGIN PFP */
 void Get_BAT_Value(void);
 uint8_t Send_Cmd(uint8_t *cmd, uint8_t len, char *recdata);
+void NB_Rec_Handler(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -122,9 +139,13 @@ int main(void)
   /* USER CODE BEGIN 2 */
   HAL_GPIO_WritePin(PWR_LED_GPIO_Port, PWR_LED_Pin, GPIO_PIN_RESET); // light up the power indicator
   HAL_GPIO_WritePin(GPIOA, PWR_EN_Pin, GPIO_PIN_SET); // maintain power
+	while(HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_1) == 0);
 	HAL_GPIO_WritePin(GPIOA, NB_PWR_Pin, GPIO_PIN_SET);	// getting the bc20 module to power on
-	HAL_Delay(2000);
+	HAL_Delay(600);
 	HAL_GPIO_WritePin(GPIOA, NB_PWR_Pin, GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(GPIOA, NB_RST_Pin, GPIO_PIN_SET);	// getting the bc20 module to restart
+	HAL_Delay(60);
+	HAL_GPIO_WritePin(GPIOA, NB_RST_Pin, GPIO_PIN_RESET);
   HAL_Delay(10000);
 	// verify that bc20 is normal
 	while(Send_Cmd((uint8_t *)"AT\r\n", 4, "OK") != 0)
@@ -157,6 +178,12 @@ int main(void)
 			}
 		}
 		HAL_Delay(1000);
+		// if power off is needed
+		if(HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_1) == 0) {
+			HAL_GPIO_WritePin(PWR_LED_GPIO_Port, PWR_LED_Pin, GPIO_PIN_SET); // extinguish the power indicator
+			while(HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_1) == 0);
+			HAL_GPIO_WritePin(GPIOA, PWR_EN_Pin, GPIO_PIN_RESET); // turn off power
+		}
 	}
 	printf("NB_Signal_Value = %d\r\n", NB_Signal_Value);
 	// wait until eps network is successfully registered
@@ -171,7 +198,7 @@ int main(void)
 		HAL_Delay(1000);
 	}
 	printf("the ps has attached\r\n");
-	// power on the GNSS
+	// turn on the GNSS power
 	while(Send_Cmd((uint8_t *)"AT+QGNSSC=1\r\n", 13, "OK") != 0)
 	{
 		HAL_Delay(1000);
@@ -183,6 +210,16 @@ int main(void)
 		HAL_Delay(1000);
 	}
 	printf("the GNSS is powered on\r\n");
+	// create communication suit instance
+	Send_Cmd((uint8_t *)"AT+MIPLCREATE\r\n", 15, "OK");
+	HAL_Delay(100);
+	// add 3320 object
+	Send_Cmd((uint8_t *)"AT+MIPLADDOBJ=0,3320,1,\"1\",1,0\r\n", 32, "OK");
+	// add 3336 object
+	Send_Cmd((uint8_t *)"AT+MIPLADDOBJ=0,3336,1,\"1\",2,0\r\n", 32, "OK");
+	HAL_Delay(100);
+	// send a registration request to OneNet
+	Send_Cmd((uint8_t *)"AT+MIPLOPEN=0,86400\r\n", 21, "OK");
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -216,6 +253,7 @@ int main(void)
 			Res1_Sign = 0;
 			HAL_UART_Transmit(&huart2, Res1_Buf, Res1_Count, 1000);		// send the received data to serial assistant
 			Res1_Count = 0;
+			NB_Rec_Handler();
 		}
 		// if power off is needed
 		if(HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_1) == 0) {
@@ -225,7 +263,7 @@ int main(void)
 		}
 	
 		main_count++;
-		HAL_Delay(1);
+		HAL_Delay(0);
 		if(main_count > 1000)
 		{
 			main_count = 0;
@@ -240,10 +278,26 @@ int main(void)
 			if (BAT_Value > 4.1)
 				BAT_Q = 100;
 			else if(BAT_Value < 3.0)
+			{
 				BAT_Q = 0;
+				shutdown++;
+				if(shutdown > 2)
+				{
+					HAL_GPIO_WritePin(GPIOA, PWR_EN_Pin, GPIO_PIN_RESET); // turn off power
+				}
+			}
 			else 
 			{
 				BAT_Q = 100 - (4.1-BAT_Value) * 100 / 1.1;
+			}
+			if(onenet_ok == 2) // if it has successfully registered with onenet 
+			{
+				NB_NOTIFY5700_CMD[33+NB_OB3320_count] = BAT_Q/100+0x30;
+				NB_NOTIFY5700_CMD[34+NB_OB3320_count] = BAT_Q%100/10+0x30;
+				NB_NOTIFY5700_CMD[35+NB_OB3320_count] = BAT_Q%10+0x30;
+				Send_Cmd(NB_NOTIFY5700_CMD, 42+NB_OB3320_count, "OK");
+				//
+				HAL_UART_Transmit(&hlpuart1, (uint8_t *)"AT+QGNSSRD=\"NMEA/RMC\"\r\n", 23, 1000);
 			}
 			//printf("VDDA_Value = %.2f\r\n", VDDA_Value);
 			//printf("BAT_Value = %.2f\r\n", BAT_Value);
@@ -561,6 +615,260 @@ uint8_t Send_Cmd(uint8_t *cmd, uint8_t len, char *recdata)
 		}
 	}
 	return ret;
+}
+// process the return data of NB
+void NB_Rec_Handler(void)
+{
+	uint8_t i, j;
+	// received subscription request
+	if(strstr((const char *)Res1_Buf, "+MIPLOBSERVE:"))
+	{
+		if(Res1_Buf[17] == ',')
+		{
+			i = 0;
+			while(Res1_Buf[18+i]!=',')
+			{
+				i++;
+				if(i > 10)
+					break;
+			}
+			if(i>10)
+			{
+				printf("+MIPLOBSERVE data acceptance error\r\n");
+			}
+			else
+			{
+				if(strstr((const char *)Res1_Buf, "3320"))
+				{
+					for(j = 0; j < i; j++)
+					{
+						NB_OBSERVERSP_CMD[20+j] = Res1_Buf[18+j];
+						NB_NOTIFY5700_CMD[16+j] = Res1_Buf[18+j];
+					}
+					NB_NOTIFY5700_CMD[16+j] = ',';
+					NB_NOTIFY5700_CMD[17+j] = '3';
+					NB_NOTIFY5700_CMD[18+j] = '3';
+					NB_NOTIFY5700_CMD[19+j] = '2';
+					NB_NOTIFY5700_CMD[20+j] = '0';
+					NB_NOTIFY5700_CMD[21+j] = ',';
+					NB_NOTIFY5700_CMD[22+j] = '0';
+					NB_NOTIFY5700_CMD[23+j] = ',';
+					NB_NOTIFY5700_CMD[24+j] = '5';
+					NB_NOTIFY5700_CMD[25+j] = '7';
+					NB_NOTIFY5700_CMD[26+j] = '0';
+					NB_NOTIFY5700_CMD[27+j] = '0';
+					NB_NOTIFY5700_CMD[28+j] = ',';
+					NB_NOTIFY5700_CMD[29+j] = '4';
+					NB_NOTIFY5700_CMD[30+j] = ',';
+					NB_NOTIFY5700_CMD[31+j] = '4';
+					NB_NOTIFY5700_CMD[32+j] = ',';
+					NB_NOTIFY5700_CMD[36+j] = ',';
+					NB_NOTIFY5700_CMD[37+j] = '0';
+					NB_NOTIFY5700_CMD[38+j] = ',';
+					NB_NOTIFY5700_CMD[39+j] = '0';
+					NB_NOTIFY5700_CMD[40+j] = '\r';
+					NB_NOTIFY5700_CMD[41+j] = '\n';
+					NB_OB3320_count = j;
+				}
+				else if(strstr((const char *)Res1_Buf, "3336"))
+				{
+					for(j = 0; j < i; j++)
+					{
+						NB_OBSERVERSP_CMD[20+j] = Res1_Buf[18+j];
+						NB_NOTIFY5513_CMD[16+j] = Res1_Buf[18+j];
+						NB_NOTIFY5514_CMD[16+j] = Res1_Buf[18+j];
+					}
+					// 5513
+					NB_NOTIFY5513_CMD[16+j] = ',';
+					NB_NOTIFY5513_CMD[17+j] = '3';
+					NB_NOTIFY5513_CMD[18+j] = '3';
+					NB_NOTIFY5513_CMD[19+j] = '3';
+					NB_NOTIFY5513_CMD[20+j] = '6';
+					NB_NOTIFY5513_CMD[21+j] = ',';
+					NB_NOTIFY5513_CMD[22+j] = '0';
+					NB_NOTIFY5513_CMD[23+j] = ',';
+					NB_NOTIFY5513_CMD[24+j] = '5';
+					NB_NOTIFY5513_CMD[25+j] = '5';
+					NB_NOTIFY5513_CMD[26+j] = '1';
+					NB_NOTIFY5513_CMD[27+j] = '3';
+					NB_NOTIFY5513_CMD[28+j] = ',';
+					NB_NOTIFY5513_CMD[29+j] = '1';
+					NB_NOTIFY5513_CMD[30+j] = ',';
+					NB_NOTIFY5513_CMD[31+j] = '9';
+					NB_NOTIFY5513_CMD[32+j] = ',';
+					NB_NOTIFY5513_CMD[33+j] = '\"';
+					NB_NOTIFY5513_CMD[43+j] = '\"';
+					NB_NOTIFY5513_CMD[44+j] = ',';
+					NB_NOTIFY5513_CMD[45+j] = '1';
+					NB_NOTIFY5513_CMD[46+j] = ',';
+					NB_NOTIFY5513_CMD[47+j] = '0';
+					NB_NOTIFY5513_CMD[48+j] = '\r';
+					NB_NOTIFY5513_CMD[49+j] = '\n';
+					// 5514
+					NB_NOTIFY5514_CMD[16+j] = ',';
+					NB_NOTIFY5514_CMD[17+j] = '3';
+					NB_NOTIFY5514_CMD[18+j] = '3';
+					NB_NOTIFY5514_CMD[19+j] = '3';
+					NB_NOTIFY5514_CMD[20+j] = '6';
+					NB_NOTIFY5514_CMD[21+j] = ',';
+					NB_NOTIFY5514_CMD[22+j] = '0';
+					NB_NOTIFY5514_CMD[23+j] = ',';
+					NB_NOTIFY5514_CMD[24+j] = '5';
+					NB_NOTIFY5514_CMD[25+j] = '5';
+					NB_NOTIFY5514_CMD[26+j] = '1';
+					NB_NOTIFY5514_CMD[27+j] = '4';
+					NB_NOTIFY5514_CMD[28+j] = ',';
+					NB_NOTIFY5514_CMD[29+j] = '1';
+					NB_NOTIFY5514_CMD[30+j] = ',';
+					NB_NOTIFY5514_CMD[31+j] = '1';
+					NB_NOTIFY5514_CMD[32+j] = '0';
+					NB_NOTIFY5514_CMD[33+j] = ',';
+					NB_NOTIFY5514_CMD[34+j] = '\"';
+					NB_NOTIFY5514_CMD[45+j] = '\"';
+					NB_NOTIFY5514_CMD[46+j] = ',';
+					NB_NOTIFY5514_CMD[47+j] = '0';
+					NB_NOTIFY5514_CMD[48+j] = ',';
+					NB_NOTIFY5514_CMD[49+j] = '0';
+					NB_NOTIFY5514_CMD[50+j] = '\r';
+					NB_NOTIFY5514_CMD[51+j] = '\n';
+					NB_OB3336_count = j;
+				}
+				NB_OBSERVERSP_CMD[20+j] = ',';
+				NB_OBSERVERSP_CMD[21+j] = '1';
+				NB_OBSERVERSP_CMD[22+j] = '\r';
+				NB_OBSERVERSP_CMD[23+j] = '\n';
+				Send_Cmd(NB_OBSERVERSP_CMD, 24+j, "OK");
+			}
+		}
+	}
+	// received resource request
+	else if(strstr((const char *)Res1_Buf, "+MIPLDISCOVER:"))
+	{
+		if(Res1_Buf[18] == ',')
+		{
+			i = 0;
+			while(Res1_Buf[19+i]!=',')
+			{
+				i++;
+				if(i > 10)
+					break;
+			}
+			if(i>10)
+			{
+				printf("+MIPLDISCOVER data acceptance error\r\n");
+			}
+			else
+			{
+				for(j = 0; j < i; j++)
+				{
+					NB_DISCOVERRSP_CMD[21+j] = Res1_Buf[19+j];
+				}
+				if(strstr((const char *)Res1_Buf, "3336"))
+				{
+					NB_DISCOVERRSP_CMD[21+j] = ',';
+					NB_DISCOVERRSP_CMD[22+j] = '1';
+					NB_DISCOVERRSP_CMD[23+j] = ',';
+					NB_DISCOVERRSP_CMD[24+j] = '9';
+					NB_DISCOVERRSP_CMD[25+j] = ',';
+					NB_DISCOVERRSP_CMD[26+j] = '\"';
+					NB_DISCOVERRSP_CMD[27+j] = '5';
+					NB_DISCOVERRSP_CMD[28+j] = '5';
+					NB_DISCOVERRSP_CMD[29+j] = '1';
+					NB_DISCOVERRSP_CMD[30+j] = '3';
+					NB_DISCOVERRSP_CMD[31+j] = ';';
+					NB_DISCOVERRSP_CMD[32+j] = '5';
+					NB_DISCOVERRSP_CMD[33+j] = '5';
+					NB_DISCOVERRSP_CMD[34+j] = '1';
+					NB_DISCOVERRSP_CMD[35+j] = '4';
+					NB_DISCOVERRSP_CMD[36+j] = '\"';
+					NB_DISCOVERRSP_CMD[37+j] = '\r';
+					NB_DISCOVERRSP_CMD[38+j] = '\n';
+					Send_Cmd(NB_DISCOVERRSP_CMD, 39+j, "OK");
+					onenet_ok++;
+				}
+				else if(strstr((const char *)Res1_Buf, "3320"))
+				{
+					NB_DISCOVERRSP_CMD[21+j] = ',';
+					NB_DISCOVERRSP_CMD[22+j] = '1';
+					NB_DISCOVERRSP_CMD[23+j] = ',';
+					NB_DISCOVERRSP_CMD[24+j] = '4';
+					NB_DISCOVERRSP_CMD[25+j] = ',';
+					NB_DISCOVERRSP_CMD[26+j] = '\"';
+					NB_DISCOVERRSP_CMD[27+j] = '5';
+					NB_DISCOVERRSP_CMD[28+j] = '7';
+					NB_DISCOVERRSP_CMD[29+j] = '0';
+					NB_DISCOVERRSP_CMD[30+j] = '0';
+					NB_DISCOVERRSP_CMD[31+j] = '\"';
+					NB_DISCOVERRSP_CMD[32+j] = '\r';
+					NB_DISCOVERRSP_CMD[33+j] = '\n';
+					Send_Cmd(NB_DISCOVERRSP_CMD, 34+j, "OK");
+					onenet_ok++;
+				}
+				
+			}
+		}
+	}
+	// received GNSS information
+	if(strstr((const char *)Res1_Buf, "+QGNSSRD:"))
+	{
+		// if latitude and longitude is getted
+		if(Res1_Buf[29] == 'A')
+		{
+			// get latitude
+			temp_int = (Res1_Buf[33]-0x30) * 100000 
+				+ (Res1_Buf[34]-0x30) * 10000
+				+ (Res1_Buf[36]-0x30) * 1000
+				+ (Res1_Buf[37]-0x30) * 100
+				+ (Res1_Buf[38]-0x30) * 10
+				+ (Res1_Buf[39]-0x30);	// 487157
+			temp_float = (float)temp_int / 600000;	// 487157/600000=0.811928
+			lat_int = (Res1_Buf[31]-0x30) * 10 + (Res1_Buf[32]-0x30);	// 37
+			lat_float = temp_float + (float)lat_int;	// 37.811928
+			lat_float = lat_float * 1000000;	// 37811928.0
+			lat_int = lat_float;	// 37811928
+			NB_NOTIFY5513_CMD[34+NB_OB3336_count] = lat_int/10000000 + 0x30;	// 3
+			NB_NOTIFY5513_CMD[35+NB_OB3336_count] = lat_int%10000000/1000000 + 0x30;	// 7
+			NB_NOTIFY5513_CMD[36+NB_OB3336_count] = '.';	// .
+			NB_NOTIFY5513_CMD[37+NB_OB3336_count] = lat_int%1000000/100000 + 0x30;	// 8
+			NB_NOTIFY5513_CMD[38+NB_OB3336_count] = lat_int%100000/10000 + 0x30;	// 1
+			NB_NOTIFY5513_CMD[39+NB_OB3336_count] = lat_int%10000/1000 + 0x30;	// 1
+			NB_NOTIFY5513_CMD[40+NB_OB3336_count] = lat_int%1000/100 + 0x30;	// 9
+			NB_NOTIFY5513_CMD[41+NB_OB3336_count] = lat_int%100/10 + 0x30;	// 2
+			NB_NOTIFY5513_CMD[42+NB_OB3336_count] = lat_int%10/1 + 0x30;	// 8
+			printf("latitude=%d\r\n", lat_int);
+			// get longitude
+			temp_int = (Res1_Buf[46]-0x30) * 100000 
+				+ (Res1_Buf[47]-0x30) * 10000
+				+ (Res1_Buf[49]-0x30) * 1000
+				+ (Res1_Buf[50]-0x30) * 100
+				+ (Res1_Buf[51]-0x30) * 10
+				+ (Res1_Buf[52]-0x30);	// 387823
+			temp_float = (float)temp_int / 600000;	// 387823/600000=0.646372
+			lng_int = (Res1_Buf[43]-0x30) * 100 
+				+ (Res1_Buf[44]-0x30) * 10
+				+ (Res1_Buf[45]-0x30);	// 112
+			lng_float = temp_float + (float)lng_int;	// 112.646372
+			lng_float = lng_float * 1000000;	// 112646372.0
+			lng_int = lng_float;	// 112646372
+			NB_NOTIFY5514_CMD[35+NB_OB3336_count] = lng_int/100000000 + 0x30;	// 1
+			NB_NOTIFY5514_CMD[36+NB_OB3336_count] = lng_int%100000000/10000000 + 0x30;	// 1
+			NB_NOTIFY5514_CMD[37+NB_OB3336_count] = lng_int%10000000/1000000 + 0x30;	// 2
+			NB_NOTIFY5514_CMD[38+NB_OB3336_count] = '.';	// .
+			NB_NOTIFY5514_CMD[39+NB_OB3336_count] = lng_int%1000000/100000 + 0x30;	// 6
+			NB_NOTIFY5514_CMD[40+NB_OB3336_count] = lng_int%100000/10000 + 0x30;	// 4
+			NB_NOTIFY5514_CMD[41+NB_OB3336_count] = lng_int%10000/1000 + 0x30;	// 6
+			NB_NOTIFY5514_CMD[42+NB_OB3336_count] = lng_int%1000/100 + 0x30;	// 3
+			NB_NOTIFY5514_CMD[43+NB_OB3336_count] = lng_int%100/10 + 0x30;	// 7
+			NB_NOTIFY5514_CMD[44+NB_OB3336_count] = lng_int%10/1 + 0x30;	// 2
+			printf("longitude=%d\r\n", lng_int);
+			
+			// send latlng information to cloud
+			Send_Cmd(NB_NOTIFY5513_CMD, 50+NB_OB3336_count, "OK");
+			HAL_UART_Transmit(&huart2, NB_NOTIFY5513_CMD, 50+NB_OB3336_count, 1000);
+			Send_Cmd(NB_NOTIFY5514_CMD, 52+NB_OB3336_count, "OK");
+			HAL_UART_Transmit(&huart2, NB_NOTIFY5514_CMD, 52+NB_OB3336_count, 1000);
+		}
+	}
 }
 /* USER CODE END 4 */
 
